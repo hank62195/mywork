@@ -1,0 +1,859 @@
+# coding=utf-8
+
+"""Download daily files from FACS
+
+This script automatically to do the followings:
+  1. Read config file
+  2. Enter user name, password, and data range to download
+  3. Login to FACS
+  4. Search on FACS for file pattern and date
+  5. If not alrady downloadwed, download file and wait for it to complete
+  6. Store file in the correct location
+
+Attributes:
+    1. Drive letter, default to E drive
+    2. Config file for file listing, default to "daily_config.txt"
+    3. Sleep time factor, default 1. If set to 2, sleep time will multiple by 2 
+    4. Turning UI on or off: On or False -> Turning UI off
+    5. Turing debug on or off: On or False -> Turn Debug off
+
+Todo:
+    * None
+
+Authors:
+    Jerry Chen (JChen: jerrychenyj@dbs.com)
+    Benny Xu   (BXu)
+
+Versions:
+    0.1 - 2019/02/23: JChen - intial idea
+    1.0 - 2019/02/26: JChen - First working version
+    1.1 - 2019/02/27: JChen - Working in Shared computer
+    1.2 - 2019/03/02: JChen - Check if there are mutliple result when search
+                            - Check if file alrady downloaded
+    1.3 - 2019/03/03: JChen - Option to turn UI on or off
+                            - Option to turn debug on or off
+    1.4 - 2019/03/04: JChen - Improve logging
+                            - Add logout function
+    1.5 - 2019/03/05: JChen - Allow download multiple files of same pattern, up to 10
+    1.6 - 2019/03/06: JChen - Improve download wait, more error checking
+    1.7 - 2019/03/09: JChen - Default from date using the last log + 1 day
+    1.8 - 2019/03/22: JChen - Add more try block to catch Web errors
+    1.9 - 2019/03/27: JChen - Add more wait (Sleep) to avoid errors
+    2.0 - 2019/03/27: JChen - Add possible reason for missing, calculate min of processing
+    2.1 - 2019/03/28: JChen - add argument for drive and config file
+    2.2 - 2019/04/07: JChen - Add sleep time factor, can increase sleep time using argument
+    2.3 - 2019/04/16: JChen - Add sleep time factor in looping
+    2.4 - 2019/07/08: BXu   - Add the anchor distinguisher     
+    2.5 - 2019/07/09: BXu   - Anchor distinguisher debug
+    2.6 - 2019/08/20: JChen - Fix bug for "Cannot find file" alert and skip this file download
+    2.7 - 2019/11/06: JChen - Fix comparison statement
+
+  Google Python Style Guide:  http://google.github.io/styleguide/pyguide.html
+
+"""
+
+
+### === Import === ###
+import getpass
+import sys
+import os
+import datetime
+import time
+import shutil
+import re
+from time import mktime
+from time import sleep
+from datetime import date
+from datetime import timedelta
+from datetime import datetime
+from selenium import webdriver
+from selenium.webdriver.common.keys import Keys
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support.ui import Select
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import TimeoutException
+from selenium.common.exceptions import StaleElementReferenceException
+from selenium.common.exceptions import UnexpectedAlertPresentException
+from selenium.common.exceptions import WebDriverException
+from selenium.common.exceptions import InvalidElementStateException
+from selenium.webdriver.common.alert import Alert
+
+
+
+### === global variables - if need to change setting  === ###
+global ADaily_dict, SLogs, ADaily_dict_failreason
+global SUrl, SProject, SChromeDriverPath, SDownloadPath, SLogPath, SDailyConfigFile
+global BUI_On, BDebug, SSplit
+global SArgDrive, SArgConfFile, ISleepFactor, SDriveLetter
+
+SUrl = "https://twrpt.twn.dbs.com/"             # FACS URL
+
+SDriveLetter = "E:"
+
+# production project
+SProject = "\\FACS_Downloads"   # project folder
+
+
+SDailyConfigFile = "\\config\\daily_config.txt"  # config file
+SChromeDriverPath = "\\ChromeDriver\\chromedriver.exe"   # driver path
+SDownloadPath = "\\download"              # Chrome default download
+SLogPath = "\\logs"                       # log path
+
+
+ISleepFactor = 1      # sleep factor, default to 1
+
+BUI_On = True    # UI switch on or off
+BDebug = True    # Turning debug on or off
+
+
+### === glbal variables - do not modify below variables === ###
+SSplit = "|||"   # split character of data config file
+
+    
+### === library functions === ###
+
+def isBlank (myString: str) -> bool:
+    """Check string blank
+
+    Args:
+        myString: string to check
+
+    Returns:
+        True: if string is blank
+        False: if string is not blank
+    """
+    return not (myString and myString.strip())
+
+
+def isNotBlank (myString: str) -> bool:
+    """Check string not blank
+
+    Args:
+        myString: string to check
+
+    Returns:
+        True: if string is not blank
+        False: if string is blank
+    """
+    return bool(myString and myString.strip())
+
+
+def daterange(start_date: date, end_date: date):
+    """List each date in between start and end date
+    Note + 1 to include last date
+
+    Args:
+        start_date: start date
+        end_date: end date
+
+    Returns:
+        yield: list of date ranges
+    """
+
+    for n in range(int ((end_date - start_date).days) + 1):
+        yield start_date + timedelta(n)
+
+
+def downloads_done(sFolder: str):
+    """Waite for Chrome download complete by 
+       1. something in the folder
+       2. file name is not .crdownload
+
+    Args:
+        sMyDownloadPath: download path to check
+
+    Returns:
+        None
+    """
+    global ISleepFactor
+    
+    list_of_files = os.listdir(sFolder)
+    
+    # if empty, then wait
+    if len(list_of_files) == 0:
+        sleep(5 * ISleepFactor)
+        downloads_done(sFolder)
+
+    for sFile in list_of_files:
+        if ".crdownload" in sFile:
+            sleep(5 * ISleepFactor)
+            downloads_done(sFolder)
+
+
+def writeToFile(sPathFileName: str, sContent: str):
+    """Write text to file
+
+    Args:
+        sPathFileName: log patch and file name
+        sContent: string to output
+
+    Returns:
+        None
+    """
+
+    file = open(sPathFileName, "a+") 
+    file.write(sContent)
+    file.close() 
+
+
+def findFirstFileMatchPrefix(sFolder: str, sPrefix: str) -> str:
+    """Find first File Match the prefix, else return ""
+
+    Args:
+        sFolder: location of folder to search
+        sPrefix: prefix of the file
+
+    Returns:
+        String: for first matched file name
+        "": cannot find any match
+    """
+    if not os.path.exists(sFolder):
+        return ""
+    
+    list_of_files = os.listdir(sFolder) #list of files in the current directory
+    for each_file in list_of_files:
+        if each_file.startswith(sPrefix):  #since its all type str you can simply use startswith
+            return each_file
+    return ""
+
+
+def findLastFileInFolder(sFolder: str) -> str:
+    """Check if folder empty
+
+    Args:
+        sFolder: location of folder to search
+
+    Returns:
+        True: if empty
+        False: if not empty
+    """
+    if not os.path.exists(sFolder):
+        return ""
+    lst = sorted(os.listdir(sFolder))
+    if len(lst) == 0:
+        return ""
+    
+    return lst[-1]
+
+
+def isFolderEmpty(sFolder: str) -> bool:
+    """Check if folder empty
+
+    Args:
+        sFolder: location of folder to search
+
+    Returns:
+        True: if empty
+        False: if not empty
+    """
+    if not os.path.exists(sFolder):
+        return True
+    
+    if len(os.listdir(sFolder)) == 0:
+        return True
+    
+    return False
+
+### === specific functions to this program === ###
+
+def readConfigFile(sConfigFile: str):
+    """Read file download config file
+
+    Args:
+        sConfigFile: location of config file
+
+    Returns:
+        None
+    """
+
+    global ADaily_dict, ADaily_dict_failreason, ADaily_dict_AnchorFile, ADaily_dict_downloaded
+    
+    if BDebug:
+        print(" ddd conf file: " + sConfigFile)
+    
+    with open(sConfigFile) as f:
+        for sOneLine in f.readlines():
+            if isNotBlank(sOneLine) and not sOneLine.startswith("#"):
+                # if BDebug:
+                #     print(" ddd one line: " + sOneLine)
+                aTmp = sOneLine.split(SSplit)
+                sFile_keyword    = aTmp[0].replace("\n", "")
+                sFile_location   = aTmp[1].replace("\n", "")
+                sFile_failReason = aTmp[2].replace("\n", "")
+                sFile_AnchorFile = aTmp[3].replace("\n", "")
+                
+                ADaily_dict[sFile_keyword] = sFile_location
+                ADaily_dict_failreason[sFile_keyword] = sFile_failReason
+
+                # add anchor file into a hash
+                ADaily_dict_AnchorFile[sFile_keyword] = sFile_AnchorFile
+                ADaily_dict_downloaded[sFile_keyword] = 0
+                
+
+    if BDebug:
+        for sKey, sValue in ADaily_dict.items():
+            print(" ddd key: " + sKey + " - value: " + sValue)
+
+
+def login(browser, sUid: str, sUpw: str):
+    """Login using user name and password
+
+    Args:
+        sUid: user name
+        sUpw: user password
+
+    Returns:
+        None
+    """
+    global ISleepFactor
+
+    login_url = SUrl
+    browser.get(login_url)	
+    sleep(1 * ISleepFactor)
+    WebDriverWait(browser, 20).until(EC.presence_of_element_located((By.ID, "btnLogin")))
+
+    webUid = browser.find_element_by_id("account_ID")
+    webUpw = browser.find_element_by_id("password")
+
+    webUid.send_keys(sUid)
+    webUpw.send_keys(sUpw)
+
+    btnLogin = WebDriverWait(browser, 20).until(EC.element_to_be_clickable((By.ID, "btnLogin")))
+    btnLogin.click()
+    sleep(2 * ISleepFactor)
+
+
+def gotoSearchScreen(browser):
+    """Use URL to go to the search screen
+
+    Args:
+        browser: Chrome browser
+
+    Returns:
+        None
+    """
+    
+    global ISleepFactor
+    
+    try:
+        sleep(1 * ISleepFactor)
+        sNew_url = SUrl + "txn/B300"
+        browser.get(sNew_url)
+        sleep(2 * ISleepFactor)
+
+    except UnexpectedAlertPresentException:
+        alert = browser.switch_to.alert
+        alert.accept()
+    
+
+def logoutFACS(browser):
+    """Log out FACS
+
+    Args:
+        browser: Chrome browser
+
+    Returns:
+        True: if logoff successfully
+        False: if logoff with error
+    """
+    sleep(1)
+    try:
+        button = browser.find_element_by_id("btnLogout")
+        button.click()     
+    except WebDriverException:
+        return False
+
+    sleep(2)
+    return True
+        
+
+def reformatPathUseDate(sPath: str, sDate: str) -> str:
+    """When there is YYYYMMDD -> reformate to actual YearMonDate formate.
+       When there i  YYYY -> reformate to actual year
+
+    Args:
+        sPath -> path
+        sDate -> date in YYYYMMDD format
+
+    Returns:
+         New formated foldername
+    """
+
+    sToPathFile = re.sub("YYYYMMDD", sDate, sPath)
+    sToPathFile = re.sub("YYYY", sDate[:4], sToPathFile)
+
+    return sToPathFile
+    
+
+def isAlreadyDownloaded(sPath: str, sFilePrefix: str, sDate: str) -> str:
+    """Check if file already download for the date
+
+    Args:
+        sPath: path of the location (in conf file)
+        sFilePrefix: file prefix to check (in config file)
+        sDate: date string in YYYYMMDD
+
+    Returns:
+        True: if file is already download
+        False: if file is not downloaded
+    """
+    sTmpPath = reformatPathUseDate(sPath, sDate)
+    
+    return findFirstFileMatchPrefix(sTmpPath, sFilePrefix)
+    
+
+def findoutNofResults(browser) -> int:
+    """Find out how many results
+
+    Args:
+        browser: Chrome browser
+
+    Returns:
+        True: success
+        False: file not found
+    """
+
+    iCount = 0
+    for i in range(1, 10):
+        try:
+            browser.find_element_by_id("jqg_GridResult_" + str(i))
+            iCount = iCount + 1
+        except WebDriverException:
+            return iCount
+    return 10
+    
+
+def downloadOneFile(browser, sFileName: str, sStartDate: str, sEndDate: str, iOrder: int = 1) -> int:
+    """Searching file using date range
+
+    Args:
+        browser: Chrome browser
+        fileName: file pattern to download
+        sStartDate: begin search date
+        sEndDate: end search date
+        iOrder: the number of checkbox to download
+
+    Returns:
+        -1: file not found or error
+         0: no file to download
+        -2: skip this download because some error
+        number of files to download
+    """
+    
+    global SLogs, ISleepFactor
+    
+    # file all element using ID
+    WebDriverWait(browser, 20).until(EC.element_to_be_clickable((By.ID, "query")))
+    WebDriverWait(browser, 20).until(EC.element_to_be_clickable((By.ID, "btnExport")))
+    
+    webFileName  = browser.find_element_by_id("fileName")
+    webStartDate = browser.find_element_by_id("startDate")
+    webEndDate   = browser.find_element_by_id("endDate")
+
+    sleep(10 * ISleepFactor)
+
+    try:
+        # clear then key in the value, and put the desired values in
+        webFileName.clear()
+        webStartDate.clear()
+        webEndDate.clear()
+        sleep(1 * ISleepFactor)
+        webFileName.send_keys(sFileName)
+        sleep(1 * ISleepFactor)
+        webStartDate.send_keys(sStartDate)
+        sleep(1 * ISleepFactor)
+        webEndDate.send_keys(sEndDate)
+        sleep(2 * ISleepFactor)
+    
+        # click on Search
+        WebDriverWait(browser, 20).until(EC.element_to_be_clickable((By.ID, "btnExport")))
+        query = WebDriverWait(browser, 20).until(EC.element_to_be_clickable((By.ID, "query")))
+        query.click()
+    except WebDriverException:
+        sOneLine = "\nxxx Fail to click Search: " + sFileName + " date: " + sStartDate + " to " +     sEndDate
+        SLogs = SLogs + sOneLine
+        print(sOneLine, end ="")
+        return -1
+    
+
+    # more error checking
+    sleep(20 * ISleepFactor)
+    WebDriverWait(browser, 20).until(EC.element_to_be_clickable((By.ID, "query")))
+    WebDriverWait(browser, 20).until(EC.element_to_be_clickable((By.ID, "btnExport")))
+
+    # get # of results using checkbox
+    iNofRes = findoutNofResults(browser)
+
+    if BDebug:
+        print(" ddd    Res: " + str(iNofRes))
+    
+    if iNofRes == 0:
+        sOneLine = "\nxxx File not found (" + str(iOrder) + "): " + sFileName + " date: " + sStartDate + " to " + sEndDate
+        SLogs = SLogs + sOneLine
+        print(sOneLine, end ="")
+        return -1
+    
+    if iNofRes < iOrder:
+        return 0
+
+    # found clickbox
+    try:
+        sleep(1 * ISleepFactor)
+        clickbox = browser.find_element_by_id("jqg_GridResult_" + str(iOrder))
+        clickbox.click()
+    except WebDriverException:
+        sOneLine = "\nxxx Fail to click (jqg_GridResult_" + str(iOrder) + "): " + sFileName + " date: " + sStartDate + " to " + sEndDate                    
+        SLogs = SLogs + sOneLine
+        print(sOneLine, end ="")
+        return -1
+
+    # click on export
+    try: 
+        sleep(2 * ISleepFactor)
+        export = WebDriverWait(browser, 20).until(EC.element_to_be_clickable((By.ID, "btnExport")))
+        export.click()
+        print(" +++ File download  (" + str(iOrder) + "): " + sFileName + " date: " + sStartDate + " to " + sEndDate, end ="")
+    except WebDriverException:
+        sOneLine = "\nxxx Fail to click Export: " + sFileName + " date: " + sStartDate + " to " +     sEndDate
+        SLogs = SLogs + sOneLine
+        print(sOneLine, end ="")
+        return -1
+
+    # wait for download to start 
+    try:
+        WebDriverWait(browser, 20).until(EC.element_to_be_clickable((By.ID, "query")))
+    except WebDriverException:
+        sOneLine = "\nxxx Error message on screen: " + sFileName + " date: " + sStartDate + " to " +     sEndDate
+        SLogs = SLogs + sOneLine
+        print(sOneLine, end ="")
+        return -2        # skip this download
+
+    sleep(3 * ISleepFactor)
+
+    return iNofRes
+
+
+def relocateDownloadFile(sFilePrefix: str, sFromFolder: str, sToFolder: str, sDate: str) -> str:
+    """Move the download file to the correct folder
+
+    Args:
+        sFilePrefix: file prefix pattern to download
+        sFromFolder: from folder name, normally is the download folder
+        sToFolder: folder to store data
+        sDate: date string in YYYYMMDD
+
+    Returns:
+        "": for empty download
+        String: Path + file name
+    """
+
+    if BDebug:
+        print(" ddd file search: " + sFromFolder + ", prefix: " + sFilePrefix)
+
+
+    # using prefix to find hte file in the download folder
+    sFromFile = findFirstFileMatchPrefix(sFromFolder, sFilePrefix)
+
+    if BDebug:
+        print(" ddd file found: " + sFromFile)
+
+    if isBlank(sFromFile):
+        return ""
+
+    # change path date
+    sToPathFile = reformatPathUseDate(sToFolder, sDate)
+
+    # create date folder if necessary
+    if not os.path.exists(sToPathFile):
+        os.makedirs(sToPathFile, exist_ok=True)
+        
+    sFromFilePath = sFromFolder + "\\" + sFromFile
+    sToFilePath   = sToPathFile + "\\" + sFromFile
+    
+    if BDebug:
+        print (" ddd Move file from: " + sFromFilePath + ", to: " + sToFilePath)
+
+    # do actual move
+    shutil.move(sFromFilePath, sToFilePath)
+    
+    if BDebug:
+        print(" ddd To dir: ")
+        dirs = os.listdir(sToPathFile)
+        # This would print all the files and directories
+        for file in dirs:
+            print(file)
+   
+    return sToFilePath
+
+
+def main():
+    """Main program
+
+    Args:
+
+    Returns:
+        None
+    """
+    
+    global ADaily_dict, SLogs, ADaily_dict_failreason, ADaily_dict_AnchorFile, ADaily_dict_downloaded
+    global SProject, SDailyConfigFile, SChromeDriverPath, SDownloadPath, SLogPath
+    global SDriveLetter, SArgDrive, SArgConfFile, ISleepFactor
+
+    # production project
+    if isNotBlank(SArgDrive):
+        SDriveLetter = SArgDrive
+
+    SProject = SDriveLetter + SProject   # project folder
+    
+    # config file
+    if isNotBlank(SArgConfFile):
+        SDailyConfigFile = SProject + "\\config\\" + SArgConfFile        
+    else:
+        SDailyConfigFile = SProject + SDailyConfigFile 
+    
+    
+    SChromeDriverPath = SProject + SChromeDriverPath      # driver path
+    SDownloadPath = SProject + SDownloadPath              # Chrome default download
+    SLogPath = SProject + SLogPath                        # log path
+
+
+    SLogs = ""
+    ADaily_dict = {}
+    ADaily_dict_failreason = {}
+    ADaily_dict_AnchorFile = {}
+    ADaily_dict_downloaded = {}
+    sOneLine = ""
+
+    dToday = date.today()
+ 
+    
+    # More checking on folders
+    if not os.path.exists(SDownloadPath):
+        print(" xxx Download path not exist: " + SDownloadPath)
+        sys.exit()
+    
+    if not os.path.exists(SLogPath):
+        print(" xxx Log path not exist: " + SLogPath)    
+        sys.exit()
+        
+    if not isFolderEmpty(SDownloadPath):
+        print(" xxx Download folder not empty, please empty it before start: " + SDownloadPath)
+        sys.exit()
+
+    # read config file
+    readConfigFile(SDailyConfigFile)
+    
+    
+    # get today's day and default To Date to - 1 day
+    sNow = str(datetime.now())
+    dDteRangeTo    = dToday - timedelta(days=1)    
+    
+    # get last run date, and set default From Date to + 1 day
+    sLastLog = findLastFileInFolder(SLogPath)
+    gMatch   = re.search("([0-9]{8})", sLastLog)
+    try:
+        dDateRangeFrom = datetime.strptime(gMatch.group(0), "%Y%m%d").date()  + timedelta(days=1)
+    except AttributeError:
+        dDateRangeFrom = dToday
+    if dDateRangeFrom > dDteRangeTo:
+        dDateRangeFrom = dDteRangeTo
+
+    # Get inputs
+    print("\n===== FACS download automation =====")
+    print("Start Time    : " + sNow)
+    print("Conf file     : " + SDailyConfigFile)
+    print("Sleep factor  : " + str(ISleepFactor))
+    print("Download path : " + SDownloadPath)
+    print("Log path      : " + SLogPath)
+    print()
+    sUid           = input("  - Enter USER ID  : ")
+    sUpw           = getpass.getpass(prompt = "  - Enter PASSWORD : ", stream = sys.stderr)
+    sDateRangeFrom = input("  - From date (YYYYMMDD), default " + dDateRangeFrom.strftime("%Y%m%d") + " : ")
+    sDteRangeTo    = input("  - To   date (YYYYMMDD), default " + dDteRangeTo.strftime("%Y%m%d") + " : ")
+    print("\n")
+    
+    # covert string to date
+    if isNotBlank(sDateRangeFrom):
+        dDateRangeFrom = datetime.strptime(sDateRangeFrom, "%Y%m%d").date()
+
+    if isNotBlank(sDteRangeTo):
+        dDteRangeTo = datetime.strptime(sDteRangeTo, "%Y%m%d").date()
+
+    if BDebug:
+        print(" ddd Date from: " + dDateRangeFrom.strftime("%Y%m%d") + ", date to: " + dDteRangeTo.strftime("%Y%m%d"))
+    
+    # Chrome setting
+    prefs = {
+        "download.default_directory": SDownloadPath,
+        "download.prompt_for_download": False,
+        "download.directory_upgrade": True,
+        "safebrowsing.enabled": False,
+        "safebrowsing.disable_download_protection": True,
+    }
+    chrome_options = webdriver.ChromeOptions()
+    
+    if not BUI_On:
+        chrome_options.add_argument("--headless")
+        chrome_options.add_argument("--disable-gpu")
+        chrome_options.add_argument("--enable-logging=v=3")
+    
+    chrome_options.add_experimental_option("prefs", prefs)
+    browser = webdriver.Chrome(chrome_options = chrome_options, executable_path = SChromeDriverPath)
+    
+    # Login
+    login(browser, sUid, sUpw)
+    sleep(3 * ISleepFactor)
+
+    # check login success or fail
+    try:
+        browser.find_element_by_id("btnLogout")
+        print (" +++   Login Successfully: " + browser.current_url)
+    except WebDriverException:
+        #login fail, quit
+        print (" XXX   Login fail: " + browser.current_url)
+        sleep(1 * ISleepFactor)
+        browser.quit()
+        input("\n  --- Click any key to quit (fail) ---")
+        sys.exit()
+    
+    
+    # for each date in between range (inclusive)
+    for single_date in daterange(dDateRangeFrom, dDteRangeTo):
+        if BDebug:
+            print (" ddd in Date loop : " + single_date.strftime("%Y/%m/%d"))
+    
+        sMyDate  =  single_date.strftime("%Y/%m/%d")
+        sMyDate2 =  single_date.strftime("%Y%m%d")
+
+        # start a new SLogs string
+        dtStart = datetime.now()
+        SLogs = "\n\n\n==================="
+        SLogs = SLogs + "\nProcess for " + sMyDate2 + " starts on: " + str(dtStart)
+        # zeroing the anchor downloaded status for another day
+        for sKey, sValue in ADaily_dict.items():
+            anchor = ADaily_dict_AnchorFile[sKey]
+            if isNotBlank(anchor):
+                ADaily_dict_downloaded[anchor] = 0
+            else:
+                ADaily_dict_downloaded[sKey] = 0
+        # for each files to download
+        for sKey, sValue in ADaily_dict.items():
+            print(" ddd key: " + sKey + " - value: " + sValue)
+            
+            anchor = ADaily_dict_AnchorFile[sKey]
+            sFileDownloaded =  isAlreadyDownloaded(sValue, sKey, sMyDate2)
+            if isNotBlank(sFileDownloaded):
+                sOneLine = "\n--- File already download   : " + sKey + ", loc: " + sValue + ", file: " + sFileDownloaded
+                SLogs = SLogs + sOneLine
+                if isNotBlank(anchor):
+                    ADaily_dict_downloaded[anchor] = 1
+                else:
+                    ADaily_dict_downloaded[sKey] = 1
+                print (sOneLine)
+            else:
+                # look the status of anchor
+                try:
+                    if (isNotBlank(anchor) and ADaily_dict_downloaded[anchor] == 1) or (isBlank(anchor)):
+                        
+                        # click url to go to search screen
+                        gotoSearchScreen(browser)
+                        
+                        # download the 1st file
+                        iNofFiles = downloadOneFile(browser, sKey, sMyDate, sMyDate, 1)
+                        if (iNofFiles == 0) or (iNofFiles == -1):
+                            #0 means no file to select, -1 means error
+                            sOneLine = "\n  xxx File missing   : " + sKey + ", loc: " + sValue
+                            sOneLine = "\n  xxx possible reason: " + ADaily_dict_failreason[sKey]
+                            SLogs = SLogs + sOneLine
+                            print (sOneLine)
+                        else:
+                            # -2 means need to skip this download
+                            if iNofFiles != -2:
+                                downloads_done(SDownloadPath)
+                                sDestPathFile = relocateDownloadFile(sKey, SDownloadPath, sValue, sMyDate2)
+                                if isNotBlank(sDestPathFile):
+                                    sOneLine = "\n  +++ File downloaded: " + sDestPathFile
+                                    if isNotBlank(anchor):
+                                        ADaily_dict_downloaded[anchor] = 1
+                                    else:
+                                        ADaily_dict_downloaded[sKey] = 1
+                                else:
+                                    sOneLine = "\n  xxx File missing when copy : " + sKey + ", loc: " + sValue
+                                
+                                SLogs = SLogs + sOneLine
+                                print (sOneLine)
+        
+                            if iNofFiles > 1:
+                                # download 2 and more files
+                                for iCurrent in range (2, iNofFiles + 1):
+                                    # click url to go to search screen
+                                    gotoSearchScreen(browser)
+                                    # download
+                                    downloadOneFile(browser, sKey, sMyDate, sMyDate, iCurrent)
+                                    downloads_done(SDownloadPath)
+                                    sDestPathFile = relocateDownloadFile(sKey, SDownloadPath, sValue, sMyDate2)
+                                    if isNotBlank(sDestPathFile):
+                                        sOneLine = "\n  +++ File downloaded (" + str(iCurrent) + ") : " + sDestPathFile
+                                        if isNotBlank(anchor):
+                                            ADaily_dict_downloaded[anchor] = 1
+                                        else:
+                                            ADaily_dict_downloaded[sKey] = 1
+                                    else:
+                                        sOneLine = "\n  xxx File missing when copy (" + str(iCurrent) + ") : " + sKey + ", loc: " + sValue
+        
+                                SLogs = SLogs + sOneLine
+                                print (sOneLine)
+                    else:
+                        sOneLine = "\n  *** anchor file missing: " + ADaily_dict_AnchorFile[sKey] + ", Stop download: " + sKey 
+                        SLogs = SLogs + sOneLine
+                        print(sOneLine)
+                        
+                except KeyError:
+                    sOneLine = "\n  *** There is no anchor file : " + ADaily_dict_AnchorFile[sKey] + ", Stop download: " + sKey 
+                    SLogs = SLogs + sOneLine
+                    print(sOneLine)
+					
+        # log footer, calcuate duratoin
+        dtEnd = datetime.now()
+        diff_in_sec = abs(mktime(dtEnd.timetuple()) - mktime(dtStart.timetuple()))
+        diff_in_min = diff_in_sec / 60
+
+        sOneLine = "\nProcess ends on: " + str(dtEnd) + " , Duration in minutes: " + str(diff_in_min)
+        SLogs = SLogs + sOneLine
+        
+        # write to log
+        writeToFile(SLogPath + "\\log_" + sMyDate2 + ".txt" , SLogs)
+        sleep(1)
+    
+    # closing
+    # input("\n\n  --- Click any key to quit (success) ---")
+    logoutFACS(browser)
+    browser.quit()
+    exit(0)
+
+# Executing main
+if __name__ == '__main__':
+    SArgDrive = ""
+    if len(sys.argv) > 1:
+        if isNotBlank(sys.argv[1]) and not (sys.argv[1].lower() == "prd" or sys.argv[1].lower() == "e"  or sys.argv[1].lower() == "e:"):
+            SArgDrive = sys.argv[1].strip()
+            if not SArgDrive.endswith(":"):
+                SArgDrive = SArgDrive + ":"
+
+    SArgConfFile = ""
+    if len(sys.argv) > 2:
+        if isNotBlank(sys.argv[2]) and not (sys.argv[2].lower() == "prd" or sys.argv[2].lower() == "daily_config.txt"):
+            SArgConfFile = sys.argv[2].strip()
+
+    if len(sys.argv) > 3:
+        if isNotBlank(sys.argv[3]) and sys.argv[3].lower() != "1":
+            ISleepFactor = int(sys.argv[3])
+
+    if len(sys.argv) > 4:
+        if isNotBlank(sys.argv[4]) and (sys.argv[4].lower() == "fasle" or sys.argv[4].lower() == "off"):
+            BUI_On = False
+    if len(sys.argv) > 5:
+        if isNotBlank(sys.argv[5]) and (sys.argv[5].lower() == "fasle" or sys.argv[5].lower() == "off"):
+            BDebug = False
+    main()
